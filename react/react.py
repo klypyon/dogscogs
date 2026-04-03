@@ -61,6 +61,7 @@ import discord
 from redbot.core import commands
 from redbot.core.bot import Red
 from redbot.core.config import Config
+import weakref
 
 from dogscogs.constants import COG_IDENTIFIER
 
@@ -70,6 +71,11 @@ from .utils import build_types_embeds, find_message_channel, validate_emoji
 RequestType = Literal["discord_deleted_user", "owner", "user", "user_strict"]
 
 log = logging.getLogger(__name__)
+
+# Coalescing window for unreact worker: group multiple unreact requests
+# for the same (guild, message, user) that arrive within this many
+# seconds into a single processing batch.
+UNREACT_COALESCE_SECONDS = 3.0
 
 
 class UndoAddView(discord.ui.View):
@@ -198,6 +204,8 @@ class React(commands.Cog):
         # handling the corresponding on_raw_reaction_remove events.
         # Shape: { guild_id: set((message_id_str, emoji_key_str, user_id_int)) }
         self._suppressed_unreacts: Dict[int, set] = {}
+        # Event used to signal background workers to exit cooperatively
+        self._shutdown: asyncio.Event = asyncio.Event()
 
         # Start the background timed-role cleanup loop. The loop waits for
         # the bot to be ready before running (see `_before_timed_role_cleanup`).
@@ -295,101 +303,161 @@ class React(commands.Cog):
             # Some test harnesses or dummy bot objects may not implement
             # `wait_until_ready`; in that case proceed immediately.
             pass
+
         while True:
-            item = None
+            items = []
+            popped = 0
             try:
-                item = await self._unreact_queue.get()
-                if not item or len(item) != 4:
-                    continue
-                guild_id, msg_id, emoji_key, user_id = item
-                guild = self.bot.get_guild(int(guild_id))
-                if guild is None:
+                # Wait for a queued item, but wake periodically to check
+                # for the shutdown flag. Using a short timeout avoids
+                # creating extra tasks and is stable across test harnesses.
+                try:
+                    first = await asyncio.wait_for(self._unreact_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    if self._shutdown.is_set():
+                        break
                     continue
 
+                popped += 1
+                if first and len(first) == 4:
+                    items.append(first)
+
+                # Coalescing window: gather quick successive requests; wake
+                # early if shutdown is signaled by waiting for the shutdown
+                # Event with a timeout equal to our coalescing window.
                 try:
-                    mcfg = await self.config.guild(guild).message_channels()
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=UNREACT_COALESCE_SECONDS)
+                except asyncio.TimeoutError:
+                    # timeout expired, proceed to drain queue
+                    pass
                 except Exception:
-                    mcfg = {}
+                    # ignore unexpected failures of the shutdown waiter
+                    pass
 
-                bot_member = guild.me
-                if bot_member is None:
+                # Drain remaining queued items
+                while True:
                     try:
-                        bot_member = await guild.fetch_member(self.bot.user.id)
-                    except Exception:
-                        bot_member = None
+                        more = self._unreact_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    popped += 1
+                    if more and len(more) == 4:
+                        items.append(more)
 
-                # Locate the message (best-effort)
-                try:
-                    ch_id, msg_obj = await find_message_channel(guild, int(msg_id), bot_member=bot_member, message_channels=mcfg, concurrency=6)
-                except Exception:
-                    msg_obj = None
-
-                if msg_obj is None:
+                if not items:
+                    # If shutdown was requested and nothing to do, exit loop
+                    if self._shutdown.is_set():
+                        break
                     continue
 
-                # Resolve emoji object for removal
-                try:
+                # Aggregate by (guild, message, user) -> set(emojis)
+                aggregates: Dict[tuple[int, str, int], set] = {}
+                for it in items:
                     try:
-                        pe = discord.PartialEmoji.from_str(str(emoji_key))
+                        g_id, m_id, em_key, u_id = it
                     except Exception:
-                        pe = None
-                    if pe is not None and getattr(pe, "id", None) is not None:
-                        emoji_obj = pe
-                    else:
-                        m = re.search(r"(\d{17,21})", str(emoji_key))
-                        if m:
+                        continue
+                    key = (int(g_id), str(m_id), int(u_id))
+                    ent = aggregates.get(key)
+                    if ent is None:
+                        ent = set()
+                        aggregates[key] = ent
+                    ent.add(str(em_key))
+
+                # Process each (guild, message, user) batch: fetch message
+                # once and remove all collected emojis for that user.
+                for (g_id, m_id, u_id), emoji_keys in aggregates.items():
+                    guild = self.bot.get_guild(int(g_id))
+                    if guild is None:
+                        continue
+
+                    try:
+                        mcfg = await self.config.guild(guild).message_channels()
+                    except Exception:
+                        mcfg = {}
+
+                    bot_member = guild.me
+                    if bot_member is None:
+                        try:
+                            bot_member = await guild.fetch_member(self.bot.user.id)
+                        except Exception:
+                            bot_member = None
+
+                    # Locate the message (best-effort)
+                    try:
+                        ch_id, msg_obj = await find_message_channel(guild, int(m_id), bot_member=bot_member, message_channels=mcfg, concurrency=6)
+                    except Exception:
+                        msg_obj = None
+
+                    if msg_obj is None:
+                        continue
+
+                    # For each emoji in the aggregated set, attempt removal
+                    for emoji_key in list(emoji_keys):
+                        # Resolve emoji object for removal
+                        try:
                             try:
-                                eobj = guild.get_emoji(int(m.group(1)))
-                                if eobj is not None:
-                                    emoji_obj = eobj
+                                pe = discord.PartialEmoji.from_str(str(emoji_key))
+                            except Exception:
+                                pe = None
+                            if pe is not None and getattr(pe, "id", None) is not None:
+                                emoji_obj = pe
+                            else:
+                                m = re.search(r"(\d{17,21})", str(emoji_key))
+                                if m:
+                                    try:
+                                        eobj = guild.get_emoji(int(m.group(1)))
+                                        if eobj is not None:
+                                            emoji_obj = eobj
+                                        else:
+                                            emoji_obj = str(emoji_key)
+                                    except Exception:
+                                        emoji_obj = str(emoji_key)
                                 else:
                                     emoji_obj = str(emoji_key)
-                            except Exception:
-                                emoji_obj = str(emoji_key)
-                        else:
+                        except Exception:
                             emoji_obj = str(emoji_key)
-                except Exception:
-                    emoji_obj = str(emoji_key)
 
-                # Attempt removal with retries/backoff
-                attempts = 0
-                max_attempts = 5
-                backoff_base = 0.5
-                while attempts < max_attempts:
-                    attempts += 1
-                    try:
-                        # mark suppression so the raw unreact event is ignored
-                        try:
-                            self._suppress_unreact(guild.id, msg_id, emoji_key, user_id)
-                        except Exception:
-                            pass
+                        # Attempt removal with retries/backoff
+                        attempts = 0
+                        max_attempts = 5
+                        backoff_base = 0.5
+                        while attempts < max_attempts:
+                            attempts += 1
+                            try:
+                                # mark suppression so the raw unreact event is ignored
+                                try:
+                                    self._suppress_unreact(guild.id, m_id, emoji_key, u_id)
+                                except Exception:
+                                    pass
 
-                        # prefer Member if resolvable; otherwise use a light-weight object
-                        user_obj = guild.get_member(user_id) or discord.Object(user_id)
-                        await msg_obj.remove_reaction(emoji_obj, user_obj)
-                        break
-                    except discord.NotFound:
-                        # message or reaction already gone
-                        break
-                    except discord.Forbidden:
-                        log.warning("Forbidden removing reaction %s from message %s for user %s in guild %s", emoji_key, msg_id, user_id, guild.id)
-                        break
-                    except discord.HTTPException:
-                        # transient error/rate-limit — backoff then retry
-                        try:
-                            await asyncio.sleep(backoff_base * attempts)
-                        except Exception:
-                            pass
-                        continue
-                    except Exception:
-                        log.exception("Unexpected error removing reaction %s on message %s for user %s in guild %s", emoji_key, msg_id, user_id, guild.id)
-                        break
+                                # prefer Member if resolvable; otherwise use a light-weight object
+                                user_obj = guild.get_member(u_id) or discord.Object(u_id)
+                                await msg_obj.remove_reaction(emoji_obj, user_obj)
+                                break
+                            except discord.NotFound:
+                                # message or reaction already gone
+                                break
+                            except discord.Forbidden:
+                                log.warning("Forbidden removing reaction %s from message %s for user %s in guild %s", emoji_key, m_id, u_id, guild.id)
+                                break
+                            except discord.HTTPException:
+                                # transient error/rate-limit — backoff then retry
+                                try:
+                                    await asyncio.sleep(backoff_base * attempts)
+                                except Exception:
+                                    pass
+                                continue
+                            except Exception:
+                                log.exception("Unexpected error removing reaction %s on message %s for user %s in guild %s", emoji_key, m_id, u_id, guild.id)
+                                break
             finally:
-                try:
-                    if item is not None:
+                # Mark all dequeued items as done
+                for _ in range(popped):
+                    try:
                         self._unreact_queue.task_done()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
     async def _role_update_worker(self) -> None:
         """Background worker: consolidate batched role add/remove operations.
@@ -410,15 +478,26 @@ class React(commands.Cog):
             items = []
             popped = 0
             try:
-                # Block until at least one item is available
-                first = await self._role_update_queue.get()
+                # Wait for a queued item, but wake periodically to check for
+                # a shutdown. Using a short timeout is simpler and more
+                # robust under different test harnesses.
+                try:
+                    first = await asyncio.wait_for(self._role_update_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    if self._shutdown.is_set():
+                        break
+                    continue
+
                 popped += 1
                 if first and len(first) == 4:
                     items.append(first)
 
-                # Small window to allow rapid coalescing of multiple enqueues
+                # Small window to allow rapid coalescing; wake early on
+                # shutdown by waiting for the shutdown waiter with a timeout.
                 try:
-                    await asyncio.sleep(0.05)
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass
                 except Exception:
                     pass
 
@@ -433,6 +512,8 @@ class React(commands.Cog):
                         items.append(more)
 
                 if not items:
+                    if self._shutdown.is_set():
+                        break
                     continue
 
                 # Aggregate per (guild, user) so we perform at most one
@@ -2072,24 +2153,62 @@ class React(commands.Cog):
 
     async def cog_unload(self) -> None:
         """Stop background tasks when the cog is unloaded."""
+        # Signal background workers to exit cooperatively.
         try:
-            self._timed_role_cleanup.cancel()
+            self._shutdown.set()
         except Exception:
             pass
+
+        # Stop the timed-role cleanup loop
         try:
-            if getattr(self, "_unreact_worker_task", None):
+            try:
+                self._timed_role_cleanup.cancel()
+            except Exception:
                 try:
-                    self._unreact_worker_task.cancel()
+                    self._timed_role_cleanup.stop()
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+        # Collect any running background tasks to await their natural exit.
+        tasks_to_await = []
+        try:
+            if getattr(self, "_unreact_worker_task", None):
+                tasks_to_await.append(self._unreact_worker_task)
         except Exception:
             pass
         try:
             if getattr(self, "_role_update_worker_task", None):
+                tasks_to_await.append(self._role_update_worker_task)
+        except Exception:
+            pass
+
+        # Await cooperative shutdown; if workers do not exit in time, cancel them.
+        if tasks_to_await:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks_to_await, return_exceptions=True), timeout=2.0)
+            except asyncio.TimeoutError:
+                for t in tasks_to_await:
+                    try:
+                        if not t.done():
+                            t.cancel()
+                    except Exception:
+                        pass
                 try:
-                    self._role_update_worker_task.cancel()
+                    await asyncio.gather(*tasks_to_await, return_exceptions=True)
                 except Exception:
                     pass
+            except Exception:
+                pass
+
+        # Clear references
+        try:
+            self._unreact_worker_task = None
+        except Exception:
+            pass
+        try:
+            self._role_update_worker_task = None
         except Exception:
             pass
 
