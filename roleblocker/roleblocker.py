@@ -82,7 +82,7 @@ class RoleBlocker(commands.Cog):
                     found_roles.sort(key=lambda role: role.created_at)
                     roles_to_be_removed = found_roles[registered_role_count:]
                     try:
-                        await member.remove_roles(*roles_to_be_removed, reason="Removing extra registered roles.")
+                        await member.remove_roles(*roles_to_be_removed, reason="Removing extra registered roles.", atomic=True)
                     except discord.Forbidden:
                         await self.bot.send_to_owners(f"Roleblocker: I do not have permission to remove roles from {member.mention} in {ctx.guild.name}.")
 

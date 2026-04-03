@@ -160,7 +160,7 @@ class SeasonalRoles(commands.Cog):
             return
 
         member : discord.Member = message.author # type: ignore[assignment]
-        await member.add_roles(*roles, reason="Seasonal roles")
+        await member.add_roles(*roles, reason="Seasonal roles", atomic=True)
 
         if await self.config.guild(guild).will_delete():
             await message.delete(delay=5)

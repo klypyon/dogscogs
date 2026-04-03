@@ -188,6 +188,16 @@ class React(commands.Cog):
         self._timed_guilds: set[int] = set()
         # per-guild locks for reaction config writes to avoid races
         self._reaction_locks: Dict[int, asyncio.Lock] = {}
+        # queue and worker for performing bot-initiated reaction removals
+        self._unreact_queue: "asyncio.Queue[tuple[int,str,str,int]]" = asyncio.Queue()
+        self._unreact_worker_task: Optional[asyncio.Task] = None
+        # queue and worker for batched role updates (add/remove consolidation)
+        self._role_update_queue: "asyncio.Queue[tuple[int,int,tuple,tuple]]" = asyncio.Queue()
+        self._role_update_worker_task: Optional[asyncio.Task] = None
+        # suppression set for bot-initiated reaction removals to avoid
+        # handling the corresponding on_raw_reaction_remove events.
+        # Shape: { guild_id: set((message_id_str, emoji_key_str, user_id_int)) }
+        self._suppressed_unreacts: Dict[int, set] = {}
 
         # Start the background timed-role cleanup loop. The loop waits for
         # the bot to be ready before running (see `_before_timed_role_cleanup`).
@@ -198,6 +208,17 @@ class React(commands.Cog):
         except RuntimeError:
             # If the loop is already running (e.g., during a reload), ignore.
             pass
+        # Start the unreact worker (best-effort; ignore runtime errors on reload)
+        try:
+            self._unreact_worker_task = asyncio.create_task(self._unreact_worker())
+        except RuntimeError:
+            # ignore if loop not running or on reload
+            self._unreact_worker_task = None
+        # Start the role-update worker (best-effort; ignore runtime errors on reload)
+        try:
+            self._role_update_worker_task = asyncio.create_task(self._role_update_worker())
+        except RuntimeError:
+            self._role_update_worker_task = None
 
     def _get_timed_lock(self, guild_id: int) -> asyncio.Lock:
         """Return (and create if needed) a per-guild asyncio.Lock."""
@@ -214,6 +235,274 @@ class React(commands.Cog):
             lock = asyncio.Lock()
             self._reaction_locks[guild_id] = lock
         return lock
+
+    def _suppress_unreact(self, guild_id: int, message_id: str, emoji_key: str, user_id: int) -> None:
+        """Record a bot-initiated unreact so the upcoming raw removal
+        event can be ignored by `handle_unreact`.
+        """
+        try:
+            s = self._suppressed_unreacts.get(guild_id)
+            if s is None:
+                s = set()
+                self._suppressed_unreacts[guild_id] = s
+            s.add((str(message_id), str(emoji_key), int(user_id)))
+        except Exception:
+            # best-effort; do not let suppression failures break processing
+            pass
+
+    def enqueue_role_update(self, guild_id: int, user_id: int, add_role_ids=None, remove_role_ids=None) -> None:
+        """Enqueue a batched role update for background consolidation.
+
+        Arguments are best-effort: role ids may be ints or strings. This
+        call is non-blocking and failures are logged but do not raise.
+        """
+        try:
+            adds = [str(x) for x in (add_role_ids or [])]
+            removes = [str(x) for x in (remove_role_ids or [])]
+            try:
+                self._role_update_queue.put_nowait((int(guild_id), int(user_id), tuple(adds), tuple(removes)))
+            except Exception:
+                asyncio.create_task(self._role_update_queue.put((int(guild_id), int(user_id), tuple(adds), tuple(removes))))
+        except Exception:
+            log.exception("Failed to enqueue role update for guild %s user %s", guild_id, user_id)
+
+    def enqueue_unreact(self, guild_id: int, message_id: str, emoji_key: str, user_id: int) -> None:
+        """Enqueue a bot-initiated reaction removal for background processing.
+
+        This is non-blocking and best-effort; failures are logged.
+        """
+        try:
+            self._unreact_queue.put_nowait((int(guild_id), str(message_id), str(emoji_key), int(user_id)))
+        except Exception:
+            try:
+                # fallback to scheduling a background put
+                asyncio.create_task(self._unreact_queue.put((int(guild_id), str(message_id), str(emoji_key), int(user_id))))
+            except Exception:
+                log.exception("Failed to enqueue unreact task for guild %s message %s emoji %s user %s", guild_id, message_id, emoji_key, user_id)
+
+    async def _unreact_worker(self) -> None:
+        """Background worker: remove queued reactions reliably with backoff.
+
+        The worker locates the message (using `message_channels` fast-path or
+        a channel scan via `find_message_channel`), attempts to remove the
+        reaction on behalf of the configured user, and retries on transient
+        failures with exponential backoff. Each removal is suppressed via
+        `_suppress_unreact` to avoid re-processing the resulting raw event.
+        """
+        try:
+            await self.bot.wait_until_ready()
+        except Exception:
+            # Some test harnesses or dummy bot objects may not implement
+            # `wait_until_ready`; in that case proceed immediately.
+            pass
+        while True:
+            item = None
+            try:
+                item = await self._unreact_queue.get()
+                if not item or len(item) != 4:
+                    continue
+                guild_id, msg_id, emoji_key, user_id = item
+                guild = self.bot.get_guild(int(guild_id))
+                if guild is None:
+                    continue
+
+                try:
+                    mcfg = await self.config.guild(guild).message_channels()
+                except Exception:
+                    mcfg = {}
+
+                bot_member = guild.me
+                if bot_member is None:
+                    try:
+                        bot_member = await guild.fetch_member(self.bot.user.id)
+                    except Exception:
+                        bot_member = None
+
+                # Locate the message (best-effort)
+                try:
+                    ch_id, msg_obj = await find_message_channel(guild, int(msg_id), bot_member=bot_member, message_channels=mcfg, concurrency=6)
+                except Exception:
+                    msg_obj = None
+
+                if msg_obj is None:
+                    continue
+
+                # Resolve emoji object for removal
+                try:
+                    try:
+                        pe = discord.PartialEmoji.from_str(str(emoji_key))
+                    except Exception:
+                        pe = None
+                    if pe is not None and getattr(pe, "id", None) is not None:
+                        emoji_obj = pe
+                    else:
+                        m = re.search(r"(\d{17,21})", str(emoji_key))
+                        if m:
+                            try:
+                                eobj = guild.get_emoji(int(m.group(1)))
+                                if eobj is not None:
+                                    emoji_obj = eobj
+                                else:
+                                    emoji_obj = str(emoji_key)
+                            except Exception:
+                                emoji_obj = str(emoji_key)
+                        else:
+                            emoji_obj = str(emoji_key)
+                except Exception:
+                    emoji_obj = str(emoji_key)
+
+                # Attempt removal with retries/backoff
+                attempts = 0
+                max_attempts = 5
+                backoff_base = 0.5
+                while attempts < max_attempts:
+                    attempts += 1
+                    try:
+                        # mark suppression so the raw unreact event is ignored
+                        try:
+                            self._suppress_unreact(guild.id, msg_id, emoji_key, user_id)
+                        except Exception:
+                            pass
+
+                        # prefer Member if resolvable; otherwise use a light-weight object
+                        user_obj = guild.get_member(user_id) or discord.Object(user_id)
+                        await msg_obj.remove_reaction(emoji_obj, user_obj)
+                        break
+                    except discord.NotFound:
+                        # message or reaction already gone
+                        break
+                    except discord.Forbidden:
+                        log.warning("Forbidden removing reaction %s from message %s for user %s in guild %s", emoji_key, msg_id, user_id, guild.id)
+                        break
+                    except discord.HTTPException:
+                        # transient error/rate-limit — backoff then retry
+                        try:
+                            await asyncio.sleep(backoff_base * attempts)
+                        except Exception:
+                            pass
+                        continue
+                    except Exception:
+                        log.exception("Unexpected error removing reaction %s on message %s for user %s in guild %s", emoji_key, msg_id, user_id, guild.id)
+                        break
+            finally:
+                try:
+                    if item is not None:
+                        self._unreact_queue.task_done()
+                except Exception:
+                    pass
+
+    async def _role_update_worker(self) -> None:
+        """Background worker: consolidate batched role add/remove operations.
+
+        The worker collects closely timed role-update intents for the same
+        guild+user and applies the net adds/removes in one or two atomic
+        role operations. Retries on transient errors with exponential
+        backoff. This is best-effort and does not guarantee strict
+        ordering across different users or guilds.
+        """
+        try:
+            await self.bot.wait_until_ready()
+        except Exception:
+            # Proceed immediately if test harness provides no wait_until_ready
+            pass
+
+        while True:
+            items = []
+            popped = 0
+            try:
+                # Block until at least one item is available
+                first = await self._role_update_queue.get()
+                popped += 1
+                if first and len(first) == 4:
+                    items.append(first)
+
+                # Small window to allow rapid coalescing of multiple enqueues
+                try:
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+
+                # Drain the rest of the currently queued items
+                while True:
+                    try:
+                        more = self._role_update_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    popped += 1
+                    if more and len(more) == 4:
+                        items.append(more)
+
+                if not items:
+                    continue
+
+                # Aggregate per (guild, user) so we perform at most one
+                # add/remove pair per member in this batch loop.
+                aggregates: Dict[tuple[int, int], Dict[str, set]] = {}
+                for it in items:
+                    try:
+                        g_id, u_id, adds, removes = it
+                    except Exception:
+                        continue
+                    key = (int(g_id), int(u_id))
+                    ent = aggregates.get(key)
+                    if ent is None:
+                        ent = {"adds": set(), "removes": set()}
+                        aggregates[key] = ent
+                    ent["adds"].update(str(x) for x in (adds or ()) if x)
+                    ent["removes"].update(str(x) for x in (removes or ()) if x)
+
+                # Apply aggregated updates per-member
+                for (g_id, u_id), sets in aggregates.items():
+                    adds_set = sets.get("adds", set())
+                    removes_set = sets.get("removes", set())
+                    final_adds = list(adds_set - removes_set)
+                    final_removes = list(removes_set - adds_set)
+
+                    guild = self.bot.get_guild(int(g_id))
+                    if guild is None:
+                        continue
+                    member = guild.get_member(int(u_id))
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(int(u_id))
+                        except Exception:
+                            member = None
+                    if member is None:
+                        continue
+
+                    add_roles = await self.resolve_manageable_roles(guild, final_adds) if final_adds else []
+                    remove_roles = await self.resolve_manageable_roles(guild, final_removes) if final_removes else []
+
+                    attempts = 0
+                    max_attempts = 5
+                    backoff_base = 0.5
+                    while attempts < max_attempts:
+                        attempts += 1
+                        try:
+                            if add_roles:
+                                await member.add_roles(*add_roles, reason="batched role update", atomic=True)
+                            if remove_roles:
+                                await member.remove_roles(*remove_roles, reason="batched role update", atomic=True)
+                            break
+                        except discord.Forbidden:
+                            log.warning("Forbidden applying batched role update for user %s in guild %s", u_id, g_id)
+                            break
+                        except discord.HTTPException:
+                            try:
+                                await asyncio.sleep(backoff_base * attempts)
+                            except Exception:
+                                pass
+                            continue
+                        except Exception:
+                            log.exception("Unexpected error applying batched role update for user %s in guild %s", u_id, g_id)
+                            break
+            finally:
+                # Mark all dequeued items as done
+                for _ in range(popped):
+                    try:
+                        self._role_update_queue.task_done()
+                    except Exception:
+                        pass
 
     def _emoji_key_matches(self, key: str, payload_emoji: object) -> bool:
         """Return True if the stored key likely refers to the given payload emoji.
@@ -1130,6 +1419,166 @@ class React(commands.Cog):
         for embed in embeds:
             await ctx.send(embed=embed, allowed_mentions=allowed)
 
+    @reactrole.command(name="diag")
+    @commands.guild_only()
+    @commands.has_guild_permissions(manage_roles=True)
+    async def reactrole_diag(self, ctx: commands.Context, message: Optional[str] = None) -> None:
+        """Diagnostic: dump `message_channels` and a reactions summary.
+
+        Usage: `reactrole diag` or `reactrole diag <message_id_or_link>`
+        """
+        if ctx.guild is None:
+            await ctx.send("This command must be used in a guild.")
+            return
+
+        try:
+            mcfg = await self.config.guild(ctx.guild).message_channels()
+        except Exception:
+            mcfg = {}
+        try:
+            cfg = await self.config.guild(ctx.guild).reactions()
+        except Exception:
+            cfg = {}
+
+        if message:
+            token = str(message)
+            matches = re.findall(r"\d{17,21}", token)
+            if not matches:
+                await ctx.send(f"Could not parse message id from `{message}`.")
+                return
+            mid = str(matches[-1])
+            channel_id = None
+            try:
+                if isinstance(mcfg, dict):
+                    # stored as string keys
+                    channel_id = mcfg.get(mid) or mcfg.get(int(mid))
+            except Exception:
+                channel_id = None
+            ch_obj = None
+            if channel_id is not None:
+                try:
+                    ch_obj = ctx.guild.get_channel(int(channel_id))
+                except Exception:
+                    ch_obj = None
+
+            mapping_info = "(no mapping)"
+            try:
+                if mid in (cfg or {}):
+                    mapping_info = f"{len(cfg.get(mid, {}))} mapping(s) present"
+            except Exception:
+                mapping_info = "(unknown)"
+
+            lines = [
+                f"message_id: {mid}",
+                f"stored_channel_id: {channel_id}",
+                f"channel_object: {getattr(ch_obj, 'id', repr(ch_obj))}",
+                f"reactions_mapping: {mapping_info}",
+            ]
+            await ctx.send("``\n" + "\n".join(lines) + "\n``")
+            return
+
+        # No specific message: dump summary and stored channel mapping
+        import json
+
+        try:
+            mcfg_str = json.dumps(mcfg, indent=2)
+        except Exception:
+            mcfg_str = str(mcfg)
+        try:
+            total_msgs = len(list((cfg or {}).keys()))
+        except Exception:
+            total_msgs = "unknown"
+
+        body = f"message_channels:\n{mcfg_str}\n\nreactions_config_messages: {total_msgs}"
+        if len(body) > 1900:
+            body = body[:1900] + "\n...[truncated]"
+        await ctx.send("```\n" + body + "\n```")
+
+    @reactrole.command(name="sync")
+    @commands.guild_only()
+    @commands.has_guild_permissions(manage_roles=True)
+    async def reactrole_sync(self, ctx: commands.Context, mode: str = "dry") -> None:
+        """Scan configured message IDs to locate their channels.
+
+        Usage: `reactrole sync` (dry-run) or `reactrole sync apply` to persist found mappings.
+        """
+        if ctx.guild is None:
+            await ctx.send("This command must be used in a guild.")
+            return
+
+        mode_str = (mode or "").strip().lower()
+        apply_changes = mode_str in ("apply", "persist", "save")
+
+        try:
+            cfg = await self.config.guild(ctx.guild).reactions()
+        except Exception:
+            await ctx.send("Failed to read reactions config.")
+            return
+
+        if not cfg:
+            await ctx.send("No reaction-role mappings configured for this guild.")
+            return
+
+        try:
+            mcfg = await self.config.guild(ctx.guild).message_channels() or {}
+        except Exception:
+            mcfg = {}
+
+        # Pre-resolve bot member for permission checks
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            try:
+                bot_member = await ctx.guild.fetch_member(self.bot.user.id)
+            except Exception:
+                bot_member = None
+
+        mids = []
+        for k in (cfg or {}).keys():
+            try:
+                mids.append(int(k))
+            except Exception:
+                continue
+
+        found: dict[str, int] = {}
+
+        async def _scan_one(mid: int):
+            try:
+                ch_id, _ = await find_message_channel(ctx.guild, mid, bot_member=bot_member, message_channels=mcfg, concurrency=6)
+                return mid, ch_id
+            except Exception:
+                return mid, None
+
+        # Process in small batches to avoid excessive concurrent channel fetches
+        BATCH = 6
+        for i in range(0, len(mids), BATCH):
+            batch = mids[i : i + BATCH]
+            tasks = [_scan_one(mid) for mid in batch]
+            try:
+                results = await asyncio.gather(*tasks)
+            except Exception:
+                results = []
+            for mid, ch_id in results:
+                if ch_id is not None:
+                    found[str(mid)] = int(ch_id)
+
+        summary_lines = [f"Scanned {len(mids)} message(s). Found {len(found)} channel mappings."]
+        if found:
+            sample = list(found.items())[:8]
+            for mid, ch in sample:
+                summary_lines.append(f"{mid} -> {ch}")
+
+        if apply_changes and found:
+            try:
+                # Merge but do not overwrite existing entries unless discovered now
+                new_map = dict(mcfg or {})
+                new_map.update(found)
+                await self.config.guild(ctx.guild).message_channels.set(new_map)
+                summary_lines.insert(0, "Applied discovered mappings to `message_channels`.")
+            except Exception:
+                summary_lines.insert(0, "Failed to persist discovered mappings — see logs.")
+
+        await ctx.send("``\n" + "\n".join(summary_lines) + "\n``")
+
     @reactrole.command(name="types")
     @commands.guild_only()
     @commands.has_guild_permissions(manage_roles=True)
@@ -1340,6 +1789,19 @@ class React(commands.Cog):
                 continue
         if emoji_key is None:
             return
+
+        # If this unreact was initiated by the bot (we suppressed it),
+        # ignore it and clear the suppression entry.
+        try:
+            sup = self._suppressed_unreacts.get(guild.id) if hasattr(self, "_suppressed_unreacts") else None
+            if sup and (msg_id, emoji_key, int(payload.user_id)) in sup:
+                try:
+                    sup.discard((msg_id, emoji_key, int(payload.user_id)))
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
 
         raw_action = msg_map.get(emoji_key)
         if not isinstance(raw_action, dict):
@@ -1612,6 +2074,22 @@ class React(commands.Cog):
         """Stop background tasks when the cog is unloaded."""
         try:
             self._timed_role_cleanup.cancel()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_unreact_worker_task", None):
+                try:
+                    self._unreact_worker_task.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_role_update_worker_task", None):
+                try:
+                    self._role_update_worker_task.cancel()
+                except Exception:
+                    pass
         except Exception:
             pass
 

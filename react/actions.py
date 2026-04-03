@@ -68,6 +68,8 @@ import logging
 import copy
 
 import discord
+import asyncio
+from .utils import find_message_channel
 
 if TYPE_CHECKING:
     # Import the cog only for type-checkers to avoid runtime circular
@@ -144,6 +146,77 @@ class ReactionAction(ABC):
             return [str(k) for k in v.keys()]
         return [str(v)]
 
+    async def _notify_member(
+        self,
+        member: Optional[discord.Member],
+        guild: discord.Guild,
+        *,
+        added: Optional[list] = None,
+        removed: Optional[list] = None,
+        message: Optional[discord.Message] = None,
+        emoji: Optional[object] = None,
+        extra: Optional[str] = None,
+    ) -> None:
+        """Send a brief DM to ``member`` describing added/removed roles.
+
+        This is best-effort and failures (for example, DMs disabled) are
+        swallowed after logging.
+        """
+        if member is None:
+            return
+
+        try:
+            parts: list[str] = []
+            try:
+                gname = getattr(guild, "name", str(getattr(guild, "id", "?")))
+            except Exception:
+                gname = str(getattr(guild, "id", "?"))
+
+            if added:
+                try:
+                    names = ", ".join(getattr(r, "name", str(r)) for r in added)
+                except Exception:
+                    names = ", ".join(str(getattr(r, "id", r)) for r in added)
+                parts.append(f"You were given role{'s' if len(added) != 1 else ''} in {gname}: {names}")
+
+            if removed:
+                try:
+                    names = ", ".join(getattr(r, "name", str(r)) for r in removed)
+                except Exception:
+                    names = ", ".join(str(getattr(r, "id", r)) for r in removed)
+                parts.append(f"Role{'s' if len(removed) != 1 else ''} removed in {gname}: {names}")
+
+            if extra:
+                parts.append(str(extra))
+
+            if message is not None and getattr(message, "channel", None) is not None:
+                try:
+                    ch = message.channel
+                    link = f"https://discord.com/channels/{getattr(guild, 'id', '')}/{getattr(ch, 'id', '')}/{getattr(message, 'id', '')}"
+                    parts.append(f"Message: {link}")
+                except Exception:
+                    pass
+
+            if emoji is not None:
+                try:
+                    parts.append(f"Emoji: {str(emoji)}")
+                except Exception:
+                    pass
+
+            if not parts:
+                return
+
+            content = "\n".join(parts)
+            try:
+                await member.send(content)
+            except discord.Forbidden:
+                # user has DMs closed or blocked the bot
+                return
+            except Exception:
+                log.exception("Failed to DM user %s in guild %s", getattr(member, "id", None), getattr(guild, "id", None))
+        except Exception:
+            log.exception("Error constructing DM for user %s in guild %s", getattr(member, "id", None), getattr(guild, "id", None))
+
     @classmethod
     def register(cls, name: str):
         """Decorator to register an action implementation.
@@ -219,9 +292,19 @@ class StandardAction(ReactionAction):
                 log.warning("StandardAction: no manageable roles found for requested roles %s in guild %s", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.add_roles(*roles, reason=f"react role add ({payload.emoji})")
+            await member.add_roles(*roles, reason=f"react role add ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("StandardAction.on_add failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, added=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after StandardAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [getattr(r, "id", r) for r in roles], [])
+        except Exception:
+            log.exception("Failed to enqueue role update after StandardAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
     async def on_remove(self, cog: "React", payload: discord.RawReactionActionEvent, guild: discord.Guild, member: Optional[discord.Member], message: Optional[discord.Message]) -> None:
         role_ids = self._normalize_role_ids()
@@ -231,9 +314,19 @@ class StandardAction(ReactionAction):
                 log.warning("StandardAction: no manageable roles found for requested roles %s in guild %s on remove", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.remove_roles(*roles, reason=f"react role remove ({payload.emoji})")
+            await member.remove_roles(*roles, reason=f"react role remove ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("StandardAction.on_remove failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, removed=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after StandardAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [], [getattr(r, "id", r) for r in roles])
+        except Exception:
+            log.exception("Failed to enqueue role update after StandardAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
 
 @ReactionAction.register("permanent_add")
@@ -257,9 +350,19 @@ class PermanentAddAction(ReactionAction):
                 log.warning("PermanentAddAction: no manageable roles found for requested roles %s in guild %s", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.add_roles(*roles, reason=f"permanent add via reaction ({payload.emoji})")
+            await member.add_roles(*roles, reason=f"permanent add via reaction ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("PermanentAddAction.on_add failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, added=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after PermanentAddAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [getattr(r, "id", r) for r in roles], [])
+        except Exception:
+            log.exception("Failed to enqueue role update after PermanentAddAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
     async def on_remove(self, cog: "React", payload: discord.RawReactionActionEvent, guild: discord.Guild, member: Optional[discord.Member], message: Optional[discord.Message]) -> None:
         return
@@ -287,15 +390,32 @@ class PermanentRemoveAction(ReactionAction):
                 log.warning("PermanentRemoveAction: no manageable roles found for requested roles %s in guild %s", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.remove_roles(*roles, reason=f"permanent remove via reaction ({payload.emoji})")
+            await member.remove_roles(*roles, reason=f"permanent remove via reaction ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("PermanentRemoveAction.on_add failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, removed=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after PermanentRemoveAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
         for role in roles:
             try:
                 await cog.unschedule_timed_role(guild, member.id, role.id)
             except Exception:
                 log.exception("Failed to unschedule timed role %s for user %s in guild %s", getattr(role, "id", None), getattr(member, "id", None), getattr(guild, "id", None))
+
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [], [getattr(r, "id", r) for r in roles])
+        except Exception:
+            log.exception("Failed to enqueue role update after ReverseAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [], [getattr(r, "id", r) for r in roles])
+        except Exception:
+            log.exception("Failed to enqueue role update after PermanentRemoveAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
     async def on_remove(self, cog: "React", payload: discord.RawReactionActionEvent, guild: discord.Guild, member: Optional[discord.Member], message: Optional[discord.Message]) -> None:
         return
@@ -321,9 +441,14 @@ class ReverseAction(ReactionAction):
                 log.warning("ReverseAction: no manageable roles found for requested roles %s in guild %s", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.remove_roles(*roles, reason=f"reverse action remove on add ({payload.emoji})")
+            await member.remove_roles(*roles, reason=f"reverse action remove on add ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("ReverseAction.on_add failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, removed=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after ReverseAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
         for role in roles:
             try:
@@ -339,9 +464,19 @@ class ReverseAction(ReactionAction):
                 log.warning("ReverseAction: no manageable roles found for requested roles %s in guild %s on remove", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.add_roles(*roles, reason=f"reverse action add on remove ({payload.emoji})")
+            await member.add_roles(*roles, reason=f"reverse action add on remove ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("ReverseAction.on_remove failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, added=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after ReverseAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [getattr(r, "id", r) for r in roles], [])
+        except Exception:
+            log.exception("Failed to enqueue role update after ReverseAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
 
 @ReactionAction.register("grouped")
@@ -395,16 +530,76 @@ class GroupedAction(ReactionAction):
         else:
             to_remove_roles = []
 
+        removed_successful: list = []
+        added_successful: list = []
         if to_remove_roles:
             try:
-                await member.remove_roles(*to_remove_roles, reason=f"grouped action: enforce group {group}")
+                await member.remove_roles(*to_remove_roles, reason=f"grouped action: enforce group {group}", atomic=True)
             except Exception:
                 log.exception("Failed to remove group roles for user %s in guild %s", getattr(member, "id", None), getattr(guild, "id", None))
+            else:
+                removed_successful = to_remove_roles
             for role in to_remove_roles:
                 try:
                     await cog.unschedule_timed_role(guild, member.id, role.id)
                 except Exception:
                     log.exception("Failed to unschedule timed role %s for user %s in guild %s", getattr(role, "id", None), getattr(member, "id", None), getattr(guild, "id", None))
+            # Enqueue a batched role-update for eventual reconciliation of removed group roles
+            try:
+                if removed_successful:
+                    cog.enqueue_role_update(guild.id, member.id, [], [getattr(r, "id", r) for r in removed_successful])
+            except Exception:
+                log.exception("Failed to enqueue role update for grouped removals in guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+
+        # Enqueue background unreact tasks for other group mappings. The
+        # worker will locate messages and perform removals with retries and
+        # backoff so we do not limit the number of reactions here.
+        if group:
+            try:
+                cfg = await cog.config.guild(guild).reactions()
+            except Exception:
+                cfg = {}
+
+            payload_msg_id = str(getattr(payload, "message_id", ""))
+            payload_emoji_str = None
+            try:
+                payload_emoji_str = str(getattr(payload, "emoji", ""))
+            except Exception:
+                payload_emoji_str = None
+
+            for other_msg, emojis in (cfg or {}).items():
+                if not isinstance(emojis, dict):
+                    continue
+                for other_emoji, other_data in emojis.items():
+                    if not isinstance(other_data, dict):
+                        continue
+                    if other_data.get("group") != group:
+                        continue
+                    # Skip the reaction that triggered this action
+                    try:
+                        if other_msg == payload_msg_id and payload_emoji_str is not None:
+                            try:
+                                if other_emoji == payload_emoji_str or str(discord.PartialEmoji.from_str(other_emoji)) == payload_emoji_str:
+                                    continue
+                            except Exception:
+                                if other_emoji == payload_emoji_str:
+                                    continue
+                    except Exception:
+                        pass
+
+                    # Enqueue the removal task; worker will perform the actual
+                    # fetch+remove and call `_suppress_unreact` as needed.
+                    try:
+                        try:
+                            cog.enqueue_unreact(guild.id, other_msg, other_emoji, member.id)
+                        except Exception:
+                            # fallback to directly pushing into the queue
+                            try:
+                                cog._unreact_queue.put_nowait((guild.id, str(other_msg), str(other_emoji), member.id))
+                            except Exception:
+                                log.exception("Failed to enqueue unreact task for message %s emoji %s user %s guild %s", other_msg, other_emoji, getattr(member, "id", None), getattr(guild, "id", None))
+                    except Exception:
+                        log.exception("Failed preparing unreact task for message %s emoji %s user %s guild %s", other_msg, other_emoji, getattr(member, "id", None), getattr(guild, "id", None))
 
         roles = await cog.resolve_manageable_roles(guild, role_ids)
         if not roles:
@@ -412,9 +607,24 @@ class GroupedAction(ReactionAction):
                 log.warning("GroupedAction: no manageable roles found for requested roles %s in guild %s", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.add_roles(*roles, reason=f"grouped action add ({group})")
+            await member.add_roles(*roles, reason=f"grouped action add ({group})", atomic=True)
         except Exception:
             log.exception("Failed to add grouped roles for user %s in guild %s", getattr(member, "id", None), getattr(guild, "id", None))
+        else:
+            added_successful = roles
+
+        # Enqueue a batched role-update for eventual reconciliation of added group roles
+        try:
+            if added_successful:
+                cog.enqueue_role_update(guild.id, member.id, [getattr(r, "id", r) for r in added_successful], [])
+        except Exception:
+            log.exception("Failed to enqueue role update for grouped additions in guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+
+        if removed_successful or added_successful:
+            try:
+                await self._notify_member(member, guild, added=(added_successful or None), removed=(removed_successful or None), message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after GroupedAction in guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
     async def on_remove(self, cog: "React", payload: discord.RawReactionActionEvent, guild: discord.Guild, member: Optional[discord.Member], message: Optional[discord.Message]) -> None:
         role_ids = self._normalize_role_ids()
@@ -424,9 +634,14 @@ class GroupedAction(ReactionAction):
                 log.warning("GroupedAction: no manageable roles found for requested roles %s in guild %s on remove", role_ids, getattr(guild, "id", None))
             return
         try:
-            await member.remove_roles(*roles, reason=f"grouped action remove ({self.cfg.get('group')})")
+            await member.remove_roles(*roles, reason=f"grouped action remove ({self.cfg.get('group')})", atomic=True)
         except Exception:
             log.exception("Failed to remove grouped roles for user %s in guild %s", getattr(member, "id", None), getattr(guild, "id", None))
+        else:
+            try:
+                await self._notify_member(member, guild, removed=roles, message=message, emoji=getattr(payload, "emoji", None))
+            except Exception:
+                log.exception("Failed to DM user after GroupedAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
 
 @ReactionAction.register("timed")
@@ -467,16 +682,28 @@ class TimedAction(ReactionAction):
             return
 
         try:
-            await member.add_roles(*roles, reason=f"timed react role add ({payload.emoji})")
+            await member.add_roles(*roles, reason=f"timed react role add ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("TimedAction.on_add failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
-
-        if duration and duration > 0:
-            for role in roles:
-                try:
-                    await cog.schedule_timed_role(guild, member.id, role.id, duration)
-                except Exception:
-                    log.exception("Failed to schedule timed removal for role %s user %s guild %s", role.id, getattr(member, "id", None), getattr(guild, "id", None))
+        else:
+            if duration and duration > 0:
+                for role in roles:
+                    try:
+                        await cog.schedule_timed_role(guild, member.id, role.id, duration)
+                    except Exception:
+                        log.exception("Failed to schedule timed removal for role %s user %s guild %s", role.id, getattr(member, "id", None), getattr(guild, "id", None))
+            extra = None
+            if duration and duration > 0:
+                extra = f"These role(s) will expire in {duration} seconds."
+            try:
+                await self._notify_member(member, guild, added=roles, message=message, emoji=getattr(payload, "emoji", None), extra=extra)
+            except Exception:
+                log.exception("Failed to DM user after TimedAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [getattr(r, "id", r) for r in roles], [])
+        except Exception:
+            log.exception("Failed to enqueue role update after TimedAction.on_add for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
 
     async def on_remove(self, cog: "React", payload: discord.RawReactionActionEvent, guild: discord.Guild, member: Optional[discord.Member], message: Optional[discord.Message]) -> None:
         if not self.remove_on_unreact:
@@ -488,12 +715,21 @@ class TimedAction(ReactionAction):
             return
 
         try:
-            await member.remove_roles(*roles, reason=f"timed react role remove ({payload.emoji})")
+            await member.remove_roles(*roles, reason=f"timed react role remove ({payload.emoji})", atomic=True)
         except Exception:
             log.exception("TimedAction.on_remove failed for guild %s, user %s", getattr(guild, "id", None), getattr(member, "id", None))
-
-        for role in roles:
+        else:
+            for role in roles:
+                try:
+                    await cog.unschedule_timed_role(guild, member.id, role.id)
+                except Exception:
+                    log.exception("Failed to unschedule timed role %s for user %s in guild %s", role.id, getattr(member, "id", None), getattr(guild, "id", None))
             try:
-                await cog.unschedule_timed_role(guild, member.id, role.id)
+                await self._notify_member(member, guild, removed=roles, message=message, emoji=getattr(payload, "emoji", None))
             except Exception:
-                log.exception("Failed to unschedule timed role %s for user %s in guild %s", role.id, getattr(member, "id", None), getattr(guild, "id", None))
+                log.exception("Failed to DM user after TimedAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
+        # Enqueue a batched role-update for eventual reconciliation
+        try:
+            cog.enqueue_role_update(guild.id, member.id, [], [getattr(r, "id", r) for r in roles])
+        except Exception:
+            log.exception("Failed to enqueue role update after TimedAction.on_remove for guild %s user %s", getattr(guild, "id", None), getattr(member, "id", None))
